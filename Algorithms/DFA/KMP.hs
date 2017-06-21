@@ -1,53 +1,66 @@
-{- KMP algorithm implementation based on Deterministic Finite State Automata -}
+-- | KMP logic 
+{-# language ScopedTypeVariables #-}
 
 module Algorithms.DFA.KMP where
 
-import Data.Bifunctor (bimap)
-import Data.Maybe (isNothing)
-import Data.Array (listArray , (!))
-import Data.List (mapAccumL)
+import Data.List (mapAccumL,tails)
+import Algorithms.DFA.KMP.Automaton
+import Data.List.NonEmpty (NonEmpty (..), toList)
+import Data.Function
+import qualified Data.List.NonEmpty as NE
+import Control.Monad.Writer
 
--- | a specialized DFA with distinguish between Left and Right jumps. Nothing signals a final state
-newtype DFA a = DFA (a -> Maybe (Either (DFA a) (DFA a)))
 
--- | create a DFA step
-step    :: Eq a 
-        => (Int -> DFA a) -- ^ index to state solver
-        ->  [(a,Int)] -- ^ Right argument to index list
-        -> Either Int Int  -- ^ fallback index
-        -> [a] -- ^ final state arguments
-        -> a -- ^ the selector
-        -> Maybe (Either (DFA a) (DFA a)) 
-step m rs l ns c 
-        | c `elem` ns = Nothing
-        | True = Just $ maybe (bimap m m  l) (Right . m) $ lookup c rs
 
--- | run the automata against an input Nothing signal success
-run :: DFA a -> [a] -> Maybe (DFA a)
-run m [] = Just m
-run (DFA m) (x:xs) = m x >>= either (flip run $ x:xs) (flip run xs)
-
--- | build a DFA from a pattern zipeed with the prefix
-mkDFA :: Eq a => [(a,Int)] -> DFA a
-mkDFA xs = let
-    a = listArray (0,length xs) ys
-    m = step (a !)
-    ys = map DFA $ from xs
-    from [(x,0)] = [m [] (Right 0) [x]]
-    from ((x,0):xs) = m [(x,1)] (Right 0) [] : core (zip [2..] xs)
-    core [(_,(x,i))] = [m  [] (Left i) [x]]
-    core ((n,(x,i)) : xs) = m [(x,n)] (Left i) [] : core xs
-    in a ! 0
-
--- | A list of prefixes to serve mkDFA
-prefix :: Eq a => [a] -> [Int]        
-prefix xs = (0:) . snd . mapAccumL f (0,xs) $ tail xs where
+-- | A list of longest suffix which is prefix length. 
+-- This is the classical KMP prefix table with indexes row shifted right by one
+table  :: Eq a 
+        => NonEmpty a  -- pattern
+        -> Table a
+table (x :| []) = Single x
+table xt@(x :| xs) = Multi x (zip xs is) z where
+        xz = toList xt
+        ((z,_),is) = mapAccumL f (0, xz) $ xs
         f (n, z:zs)  x
-                | x == z = ((n + 1,zs),n)
-                | otherwise = ((0,xs),n)        
+                | x == z = ((n + 1, zs), n)
+                | otherwise = ((0, xz), n) 
 
--- | test a match exists
-match :: Eq a => [a] -> [a] -> Bool
-match p s = isNothing $ run (mkDFA $ zip <*> prefix $ p) s
+data Table a = Single a | Multi a [(a,Index)] Index deriving Show
 
+data Logic m a b  = Logic 
+    {   fromStream :: b -> a
+    ,   logZero :: b -> m ()
+    }
+
+logic :: forall c b a m . (Monad m , Eq a) =>  Logic m a b -> Table a -> NonEmpty (Interface m b)
+logic (Logic fromStream logZero) = logic'  where
+    match x f g y 
+        | x == fromStream y = f y
+        | otherwise = return g
+    
+    logic' (Single x) = r :| [] where
+        r = match x (\y -> logZero y >> return (Step 0)) (Step 0)  
+
+    logic' (Multi x xs zi) = r :| core (zip [2..] xs) where
+        r = match x (const $ return $ Step 1) (Step 0)
+        core [(_,(x,i))] = 
+            [match x (\y -> logZero y >> return (Step zi)) (Hold i)]
+        core ((n,(x,i)) : xs) =
+            match x (const $ return $ Step n) (Hold i) : core xs
+
+(==!) :: Eq a 
+        => [a] -- ^ pattern
+        -> [a] -- ^ stream
+        -> Bool
+p ==! s = (>0) . length $ matches p s
+
+matches :: Eq a => [a] -> [a] -> [Int]
+matches pt@(p : ps) s 
+        = execWriter 
+        $ consume 
+        (automatonWithArray 
+            $ logic (Logic snd (tell . return . subtract (length ps) . fst)) 
+            $ table $ p :| ps
+            ) 
+        $ zip [0..] s 
 
